@@ -3,10 +3,9 @@ import os
 from collections import OrderedDict
 from datetime import datetime
 from math import asin, cos, radians, sin, sqrt
-
 import numpy as np
 import pandas as pd
-
+from lable import trace_id
 csv_file_port = r"./dataset/port.csv"
 csv_file_train = r"./dataset/train0523.csv"
 csv_file_order_event = r"./dataset/loadingOrderEvent.csv"
@@ -20,7 +19,7 @@ transit_port_ata = 1        # "TRANSIT PORT ATA"
 transit_port_atd = 2        # "TRANSIT PORT ATD"
 arrival_at_port = 3         # "ARRIVAL AT PORT"
 
-imp_order_df = pd.read_csv("./data_processed/imp_order.csv")
+imp_order_df = pd.read_csv("./data_processed/important_order.csv")
 imp_order = dict(zip(imp_order_df["OrderId"],imp_order_df["Trace"]))
 
 port_df = pd.read_csv(csv_file_port)
@@ -110,65 +109,106 @@ def load_gps_rec(filename, order_event):
                 data[8]         # nextport
             ])
 
-            if(cnt > 1000000):
+            if(cnt > 800000):
                 cnt = 0
                 order_id,rec = records.popitem(last=False)
                 process_order_rec(order_event, order_id,rec)
                 processed_order[order_id] = 1
         
     for order_id,rec in records.items():
-        process_order_rec(order_event, order_id,rec)
+        if order_id not in processed_order:
+            process_order_rec(order_event, order_id,rec)
 
-def process_order_rec(order_event, order_id,rec):
+def process_order_rec(order_event, order_id, rec):
+    trace = imp_order[order_id]
+
+    trace = trace.split('-')
+    for i, port1 in enumerate(trace):
+        for port2 in trace[i+1:]:
+            if '-'.join((port1,port2)) in trace_id:
+                process_order_rec0(order_event, order_id, rec, port1, port2, i==0)
+        
+
+def get_departure_index(data, port):
+    pos = port_pos[port]
+
+    mae = np.sum(np.abs(data[:,(1,2)] - pos),axis=1)
+    min_mae = np.min(mae)
+    
+    index = len(mae) - np.argmax(np.flip(mae < min_mae + 0.001))
+
+    if(min_mae < 0.2):
+        return index
+    else:
+        return None
+
+def get_arrival_index(data, port):
+    pos = port_pos[port]
+
+    mae = np.sum(np.abs(data[:,(1,2)] - pos),axis=1)
+    min_mae = np.min(mae)
+    index = np.argmax(mae < min_mae + 0.1)
+
+    if(min_mae < 0.2):
+        return index + 1
+    else:
+        return None
+
+def process_order_rec0(order_event, order_id, rec, departure, destination, is_departure_port_onboard_port):
     # rec shape:
     # time, longitude, latitude, speed, direction, nextport
     data = np.array(rec)
-    trace = imp_order[order_id]
 
-    # assume first two
-    departure ,destination = trace.split('-')[:2]
-
-    onboard_time = None
+    departure_time = None
     arrival_time = None
-    # trim data
-    dest_pos = port_pos[destination]
-    mse = np.sum(np.square(data[:,(1,2)] - dest_pos),axis=1)
-
-    min_mse = np.min(mse)
-    index = np.argmax(mse < min_mse*1.1)
-    if(index == 0):
-        index = -1
-    # try find arrivel_time in order_event
+    # try find departure_time and arrivel_time in order_event
     try:
         events = order_event[order_id]
         for (event_code,event_location,t) in events:
-            if event_code == shipment_onboard_date and event_location == departure:
-                onboard_time = t
-            elif ((event_code == arrival_at_port or event_code == transit_port_ata) and event_location == destination):
+            if (event_code == shipment_onboard_date or event_code == transit_port_atd) and event_location == departure:
+                departure_time = t
+            elif (event_code == arrival_at_port or event_code == transit_port_ata) and event_location == destination:
                 arrival_time = t
     except KeyError:
-        onboard_time = None
-        arrival_time = None
-    # if not found
-    if(arrival_time == None):
-        #arrival_time = data[-1,0]   # use last gps record as arrival_time
-        arrival_time = data[index,0]
-    if(onboard_time == None):
-        first_rec_time = data[0,0]
-        first_rec_pos = data[0,(1,2)]
-        depature_pos = port_pos[departure]
+        None
 
-        dis_to_dest = geodistance(first_rec_pos,dest_pos)
-        dis_to_depat = geodistance(first_rec_pos,depature_pos)
+    # trim data
+    if arrival_time != None:
+        arrival_index = np.argmax(data[:,0] < arrival_time)
+    else:
+        arrival_index = get_arrival_index(data, destination)
+        if(arrival_index == None):
+            print("[WRONG]Cannot find arrival index. Order id:", order_id,"Skip")
+            return
+        arrival_time = data[arrival_index - 1,0]
+    
+    if departure_time != None:
+        departure_index = np.argmax(data[:,0] > departure_time)
+    else :
+        departure_index = get_departure_index(data, departure)
+        if(departure_index == None):
+            if(is_departure_port_onboard_port == True):
+                departure_index = 0
+                first_rec_time = data[0,0]
+                first_rec_pos = data[0,(1,2)]
+                dest_pos = port_pos[destination]
+                depature_pos = port_pos[departure]
 
-        onboard_time = first_rec_time - (arrival_time - first_rec_time) * dis_to_depat / (dis_to_dest + dis_to_depat)
+                dis_to_dest = geodistance(first_rec_pos,dest_pos)
+                dis_to_depat = geodistance(first_rec_pos,depature_pos)
 
-        
-    data = data[:index + 1]
+                departure_time = first_rec_time - (arrival_time - first_rec_time) * dis_to_depat / dis_to_dest
+            else:
+                print("[WRONG]Cannot find departure index. Order id:", order_id,"Skip")
+                return
+        else :
+            departure_time = data[departure_index,0]
 
-    eta = (arrival_time - onboard_time).total_seconds()
+    data = data[departure_index:arrival_index]
+    
+    eta = (arrival_time - departure_time).total_seconds()
     #? is the first gps record time close to real onboard time ?
-    travel_time = np.array([(t - onboard_time).total_seconds() for t in data[:,0]]).reshape((-1,1))
+    travel_time = np.array([(t - departure_time).total_seconds() for t in data[:,0]]).reshape((-1,1))
 
     trace = '-'.join((departure ,destination))
 

@@ -1,6 +1,5 @@
 from numba import jitclass, typeof, njit
 
-import torch
 import os
 version = "0.0.0"
 
